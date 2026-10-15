@@ -1,0 +1,24 @@
+[project]
+name = "craftax-sgs"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Vishnu", email = "SnowSneeze@protonmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "craftax>=1.6.1",
+    "distrax>=0.1.9",
+    "flax>=0.12.8",
+    "jax[cuda12]>=0.10.2",
+    "optax>=0.2.8",
+    "wandb>=0.30.0",
+]
+
+[project.scripts]
+craftax-sgs = "craftax_sgs:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"

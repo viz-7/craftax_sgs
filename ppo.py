@@ -376,6 +376,8 @@ def run_ppo(config):
             + "-"
             + str(int(config["TOTAL_TIMESTEPS"] // 1e6))
             + "M",
+            sync_tensorboard=True,
+            mode="offline"
         )
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -420,7 +422,7 @@ if __name__ == "__main__":
         default=512,
     )
     parser.add_argument(
-        "--total_timesteps", type=lambda x: int(float(x)), default=1e9
+        "--total_timesteps", type=lambda x: int(float(x)), default=2e9
     )  # Allow scientific notation
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--num_steps", type=int, default=64)

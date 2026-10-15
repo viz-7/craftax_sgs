@@ -3,10 +3,11 @@ import time
 import jax.numpy as jnp
 import numpy as np
 import wandb
+from tensorboardX import SummaryWriter
 
 batch_logs = {}
 log_times = []
-
+tb_writer = SummaryWriter(log_dir="wandb/tens")
 
 def create_log_dict(info, config):
     to_log = {
@@ -22,21 +23,12 @@ def create_log_dict(info, config):
 
     to_log["achievements"] = sum_achievements
 
-    if config.get("TRAIN_ICM") or config.get("USE_RND"):
-        to_log["intrinsic_reward"] = info["reward_i"]
-        to_log["extrinsic_reward"] = info["reward_e"]
-
-        if config.get("TRAIN_ICM"):
-            to_log["icm_inverse_loss"] = info["icm_inverse_loss"]
-            to_log["icm_forward_loss"] = info["icm_forward_loss"]
-        elif config.get("USE_RND"):
-            to_log["rnd_loss"] = info["rnd_loss"]
-
     return to_log
 
 
 def batch_log(update_step, log, config):
     update_step = int(update_step)
+
     if update_step not in batch_logs:
         batch_logs[update_step] = []
 
@@ -44,8 +36,10 @@ def batch_log(update_step, log, config):
 
     if len(batch_logs[update_step]) == config["NUM_REPEATS"]:
         agg_logs = {}
+
         for key in batch_logs[update_step][0]:
             agg = []
+
             if key in ["goal_heatmap"]:
                 agg = [batch_logs[update_step][0][key]]
             else:
@@ -75,9 +69,36 @@ def batch_log(update_step, log, config):
             elif len(log_times) > 1:
                 dt = log_times[-1] - log_times[-2]
                 steps_between_updates = (
-                    config["NUM_STEPS"] * config["NUM_ENVS"] * config["NUM_REPEATS"]
+                    config["NUM_STEPS"]
+                    * config["NUM_ENVS"]
+                    * config["NUM_REPEATS"]
                 )
                 sps = steps_between_updates / dt
                 agg_logs["sps"] = sps
 
         wandb.log(agg_logs)
+
+        for key, value in agg_logs.items():
+            if key == "goal_heatmap":
+                continue
+
+            value = np.asarray(value)
+
+            if value.size == 0:
+                continue
+
+            if np.issubdtype(value.dtype, np.number):
+                if value.size == 1:
+                    tb_writer.add_scalar(
+                        key,
+                        value.item(),
+                        update_step,
+                    )
+                else:
+                    tb_writer.add_histogram(
+                        key,
+                        value,
+                        update_step,
+                    )
+
+        tb_writer.flush()

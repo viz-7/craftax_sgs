@@ -4,7 +4,7 @@ import chex
 import numpy as np
 from flax import struct
 from functools import partial
-from typing import Optional, Tuple, Union, Any
+from typing import Optional, Tuple, Union, Any, NamedTuple
 
 
 class GymnaxWrapper(object):
@@ -155,6 +155,59 @@ class OptimisticResetVecEnvWrapper(GymnaxWrapper):
         state, obs = jax.vmap(auto_reset)(done, state_re, state_st, obs_re, obs_st)
 
         return obs, state, reward, done, info
+
+
+class SGSState(NamedTuple):
+    env_state: object
+    idx: jnp.ndarray
+    #EMA to save memory
+    p: jnp.ndarray
+
+class SGSWrapper(GymnaxWrapper):
+    def __init__(self, env, num_envs, n_configs, t=0.5, kappa=1.0, eps=1e-4, T=2.0, H=100):
+        super().__init__(env)
+        self.n, self.N, self.t, self.k, self.eps, self.T, self.H = num_envs, n_configs, t, kappa, eps, T, H
+
+    def _sample(self, key, p):
+        w = (p + self.eps) ** (self.k * self.t) * (1 - p + self.eps) ** (self.k * (1 - self.t))
+        logits = jnp.log(w + self.eps) / max(self.T, 1.0)
+        return jax.random.categorical(key, logits, shape=(self.n,))
+
+    def _reset_to(self, key, idx, params):
+        keys = jax.random.split(key, self.n)
+        return jax.vmap(self._env.reset_to, in_axes=(0, 0, None))(keys, idx, params)
+
+    @partial(jax.jit, static_argnums=(0, 2))
+    def reset(self, key, params=None):
+        k1, k2 = jax.random.split(key)
+        p = jnp.zeros(self.N)
+        idx = self._sample(k1, p)
+        obs, st = self._reset_to(k2, idx, params)
+        return obs, SGSState(st, idx, p)
+
+    @partial(jax.jit, static_argnums=(0, 4))
+    def step(self, rng, state, action, params=None):
+        k1, k2, k3 = jax.random.split(rng, 3)
+        keys = jax.random.split(k1, self.n)
+        obs_st, st_st, reward, done, info = jax.vmap(self._env.step, in_axes=(0, 0, 0, None))(
+            keys, state.env_state, action, params
+        )
+
+        p = state.p.at[state.idx].add(
+            jnp.where(done, (info["success"] - state.p[state.idx]) / self.H, 0.0)
+        )
+
+        idx_new = self._sample(k2, p)
+        obs_re, st_re = self._reset_to(k3, idx_new, params)
+
+        def sel(a, b):
+            return jnp.where(done.reshape((-1,) + (1,) * (a.ndim - 1)), a, b)
+
+        obs = sel(obs_re, obs_st)
+        env_state = jax.tree.map(sel, st_re, st_st)
+        idx = jnp.where(done, idx_new, state.idx)
+
+        return obs, SGSState(env_state, idx, p), reward, done, info
 
 
 @struct.dataclass

@@ -20,6 +20,8 @@ def create_log_dict(info, config):
         if "achievements" in k.lower():
             to_log[k] = v
             sum_achievements += v / 100.0
+        elif k.startswith("SGS/"):
+            to_log[k] = v
 
     to_log["achievements"] = sum_achievements
 

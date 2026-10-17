@@ -12,6 +12,7 @@ from craftax.craftax_env import make_craftax_env_from_name
 import wandb
 from typing import NamedTuple
 
+from flax import struct
 from flax.training import orbax_utils
 from flax.training.train_state import TrainState
 from orbax.checkpoint import (
@@ -27,10 +28,54 @@ from models.actor_critic import (
 )
 from wrappers import (
     LogWrapper,
-    OptimisticResetVecEnvWrapper,
     BatchEnvWrapper,
     AutoResetEnvWrapper,
 )
+
+RING_BUFFER_CAPACITY = 100
+
+@struct.dataclass
+class SGSState:
+    storage: jnp.ndarray
+    cursors: jnp.ndarray
+    gen: jnp.ndarray
+
+def update_sgs_from_trajectory(sgs_state: SGSState, traj_batch) -> SGSState:
+    CAP = RING_BUFFER_CAPACITY
+
+    # (A, T, N) achievement values; same sorted order as the info dict pytree
+    keys = sorted(k for k in traj_batch.info if k.startswith("Achievements/"))
+    ach = jnp.stack([traj_batch.info[k] for k in keys])
+    A = ach.shape[0]
+
+    # Entry (a, t, n) is valid if env n finished an episode at step t having unlocked a
+    mask = ((ach > 0) & traj_batch.done.astype(bool)[None]).reshape(A, -1)  # (A, M)
+    seeds = traj_batch.seed.reshape(-1, traj_batch.seed.shape[-1])          # (M, 2)
+    M = seeds.shape[0]
+
+    # Per-achievement running index of each valid entry, and total count
+    rank = jnp.cumsum(mask, axis=1) - 1                                     # (A, M)
+    count = mask.sum(axis=1)                                                # (A,)
+
+    # If more than CAP entries arrive in one batch, keep only the newest CAP.
+    # This keeps scatter indices unique, so the result is deterministic on GPU.
+    keep = mask & (rank >= (count - CAP)[:, None])
+
+    # Ring position for each kept entry; dropped entries go out of bounds
+    pos = (sgs_state.cursors[:, None] + rank) % CAP
+    pos = jnp.where(keep, pos, CAP)
+    a_idx = jnp.broadcast_to(jnp.arange(A)[:, None], pos.shape)
+
+    storage = sgs_state.storage.at[a_idx, pos].set(
+        jnp.broadcast_to(seeds[None], (A, M, seeds.shape[-1])), mode="drop"
+    )
+
+    total = sgs_state.cursors + count
+    cursors = total % CAP
+    gen = sgs_state.gen + (total // CAP).astype(sgs_state.gen.dtype)  # number of wraps
+
+    return SGSState(storage=storage, cursors=cursors, gen=gen)
+
 
 # Code adapted from the original implementation made by Chris Lu
 # Original code located at https://github.com/luchris429/purejaxrl
@@ -47,7 +92,7 @@ class Transition(NamedTuple):
     obs: jnp.ndarray
     next_obs: jnp.ndarray
     info: jnp.ndarray
-
+    seed: jnp.ndarray
 
 def make_train(config):
     config["NUM_UPDATES"] = (
@@ -63,15 +108,8 @@ def make_train(config):
     env_params = env.default_params
 
     env = LogWrapper(env)
-    if config["USE_OPTIMISTIC_RESETS"]:
-        env = OptimisticResetVecEnvWrapper(
-            env,
-            num_envs=config["NUM_ENVS"],
-            reset_ratio=min(config["OPTIMISTIC_RESET_RATIO"], config["NUM_ENVS"]),
-        )
-    else:
-        env = AutoResetEnvWrapper(env)
-        env = BatchEnvWrapper(env, num_envs=config["NUM_ENVS"])
+    env = AutoResetEnvWrapper(env)
+    env = BatchEnvWrapper(env, num_envs=config["NUM_ENVS"])
 
     def linear_schedule(count):
         frac = (
@@ -121,6 +159,18 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         obsv, env_state = env.reset(_rng, env_params)
 
+        # INIT SGS
+        _, _, _, _, dummy_info = jax.eval_shape(
+            lambda r, s, a: env.step(r, s, a, env_params),
+            _rng, env_state, jnp.zeros(config["NUM_ENVS"], dtype=jnp.int32),
+        )
+        num_achievements = sum(1 for k in dummy_info if k.startswith("Achievements/"))
+        sgs_state = SGSState(
+            storage=jnp.zeros((num_achievements, RING_BUFFER_CAPACITY, 2), dtype=jnp.uint32),
+            cursors=jnp.zeros(num_achievements, dtype=jnp.int32),
+            gen=jnp.zeros(num_achievements, dtype=jnp.int32)
+        )
+
         # TRAIN LOOP
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
@@ -130,6 +180,7 @@ def make_train(config):
                     env_state,
                     last_obs,
                     ex_state,
+                    sgs_state,
                     rng,
                     update_step,
                 ) = runner_state
@@ -142,7 +193,8 @@ def make_train(config):
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
-                obsv, env_state, reward_e, done, info = env.step(
+                prev_seed = env_state.seed
+                obsv, env_state, reward_e, done, info, = env.step(
                     _rng, env_state, action, env_params
                 )
 
@@ -161,12 +213,14 @@ def make_train(config):
                     obs=last_obs,
                     next_obs=obsv,
                     info=info,
+                    seed=prev_seed
                 )
                 runner_state = (
                     train_state,
                     env_state,
                     obsv,
                     ex_state,
+                    sgs_state,
                     rng,
                     update_step,
                 )
@@ -182,9 +236,18 @@ def make_train(config):
                 env_state,
                 last_obs,
                 ex_state,
+                sgs_state,
                 rng,
                 update_step,
             ) = runner_state
+
+
+            # UPDATE SGS
+            sgs_state = update_sgs_from_trajectory(
+                sgs_state,
+                traj_batch,
+            )
+
             _, last_val = network.apply(train_state.params, last_obs)
 
             def _calculate_gae(traj_batch, last_val):
@@ -322,6 +385,13 @@ def make_train(config):
                 traj_batch.info,
             )
 
+            # ---- log SGS ring-buffer wrap counts per achievement ----
+            ach_keys = sorted(k for k in traj_batch.info if k.startswith("Achievements/"))
+            metric = dict(metric)
+            for i, k in enumerate(ach_keys):
+                short = k.split("/", 1)[1]              # "Achievements/wood" -> "wood"
+                metric[f"SGS/gen/{short}"] = sgs_state.gen[i].astype(jnp.float32)
+
             rng = update_state[-1]
 
             # wandb logging
@@ -342,6 +412,7 @@ def make_train(config):
                 env_state,
                 last_obs,
                 ex_state,
+                sgs_state,
                 rng,
                 update_step + 1,
             )
@@ -353,6 +424,7 @@ def make_train(config):
             env_state,
             obsv,
             ex_state,
+            sgs_state,
             _rng,
             0,
         )
@@ -411,7 +483,6 @@ def run_ppo(config):
 
         if config["SAVE_POLICY"]:
             _save_network(0, "policies")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

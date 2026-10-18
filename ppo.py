@@ -6,6 +6,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+from numpy.__config__ import CONFIG
 import optax
 from craftax.craftax_env import make_craftax_env_from_name
 
@@ -34,13 +35,25 @@ from wrappers import (
 
 RING_BUFFER_CAPACITY = 100
 
+def random_seed_frac(update_step, final=0.3, anneal_updates=400):
+    t = jnp.clip(update_step / anneal_updates, 0.0, 1.0)
+    return 1.0 + (final - 1.0) * t
+
 @struct.dataclass
 class SGSState:
     storage: jnp.ndarray
     cursors: jnp.ndarray
     gen: jnp.ndarray
+    weights: jnp.ndarray
 
-def update_sgs_from_trajectory(sgs_state: SGSState, traj_batch) -> SGSState:
+def compute_sgs_weights(gen, cursors, t, kappa, eps):
+    has_entries = (gen > 0) | (cursors > 0)               # buffer length > 0
+    g = jnp.where(has_entries, jnp.maximum(gen, 1), 0).astype(jnp.float32)
+    p = g / jnp.maximum(g.max(), 1.0)                     # (A,) in [0, 1]
+    w = (p + eps) ** (kappa * t) * (1.0 - p + eps) ** (kappa * (1.0 - t))
+    return jnp.where(has_entries, w, 0.0)                 # empties -> weight 0
+
+def update_sgs_from_trajectory(sgs_state: SGSState, t, kappa, traj_batch) -> SGSState:
     CAP = RING_BUFFER_CAPACITY
 
     # (A, T, N) achievement values; same sorted order as the info dict pytree
@@ -49,7 +62,10 @@ def update_sgs_from_trajectory(sgs_state: SGSState, traj_batch) -> SGSState:
     A = ach.shape[0]
 
     # Entry (a, t, n) is valid if env n finished an episode at step t having unlocked a
-    mask = ((ach > 0) & traj_batch.done.astype(bool)[None]).reshape(A, -1)  # (A, M)
+    mask = (
+        (ach > 0) & traj_batch.done.astype(bool)[None]
+        & ~traj_batch.from_sgs.astype(bool)[None]
+    ).reshape(A, -1)  # (A, M)
     seeds = traj_batch.seed.reshape(-1, traj_batch.seed.shape[-1])          # (M, 2)
     M = seeds.shape[0]
 
@@ -73,8 +89,9 @@ def update_sgs_from_trajectory(sgs_state: SGSState, traj_batch) -> SGSState:
     total = sgs_state.cursors + count
     cursors = total % CAP
     gen = sgs_state.gen + (total // CAP).astype(sgs_state.gen.dtype)  # number of wraps
+    weights = compute_sgs_weights(gen, cursors, t, kappa, 1e-8)
 
-    return SGSState(storage=storage, cursors=cursors, gen=gen)
+    return SGSState(storage=storage, cursors=cursors, gen=gen, weights=weights)
 
 
 # Code adapted from the original implementation made by Chris Lu
@@ -93,6 +110,7 @@ class Transition(NamedTuple):
     next_obs: jnp.ndarray
     info: jnp.ndarray
     seed: jnp.ndarray
+    from_sgs: jnp.ndarray
 
 def make_train(config):
     config["NUM_UPDATES"] = (
@@ -159,16 +177,12 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         obsv, env_state = env.reset(_rng, env_params)
 
-        # INIT SGS
-        _, _, _, _, dummy_info = jax.eval_shape(
-            lambda r, s, a: env.step(r, s, a, env_params),
-            _rng, env_state, jnp.zeros(config["NUM_ENVS"], dtype=jnp.int32),
-        )
-        num_achievements = sum(1 for k in dummy_info if k.startswith("Achievements/"))
+        num_achievements = config["NUM_ACHIEV"]
         sgs_state = SGSState(
             storage=jnp.zeros((num_achievements, RING_BUFFER_CAPACITY, 2), dtype=jnp.uint32),
             cursors=jnp.zeros(num_achievements, dtype=jnp.int32),
-            gen=jnp.zeros(num_achievements, dtype=jnp.int32)
+            gen=jnp.zeros(num_achievements, dtype=jnp.int32),
+            weights=jnp.zeros(num_achievements, dtype=jnp.float32)
         )
 
         # TRAIN LOOP
@@ -194,8 +208,10 @@ def make_train(config):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 prev_seed = env_state.seed
+                prev_from_sgs = env_state.from_sgs
+                random_frac = random_seed_frac(update_step, config["RANDOM_SEED_FINAL"], config["RANDOM_SEED_ANNEAL_UPDATES"])
                 obsv, env_state, reward_e, done, info, = env.step(
-                    _rng, env_state, action, env_params
+                    _rng, env_state, sgs_state, action, random_frac, env_params
                 )
 
                 reward_i = jnp.zeros(config["NUM_ENVS"])
@@ -213,7 +229,8 @@ def make_train(config):
                     obs=last_obs,
                     next_obs=obsv,
                     info=info,
-                    seed=prev_seed
+                    seed=prev_seed,
+                    from_sgs=prev_from_sgs
                 )
                 runner_state = (
                     train_state,
@@ -245,6 +262,8 @@ def make_train(config):
             # UPDATE SGS
             sgs_state = update_sgs_from_trajectory(
                 sgs_state,
+                config["SGS_T"],
+                config["SGS_KAPPA"],
                 traj_batch,
             )
 
@@ -484,6 +503,19 @@ def run_ppo(config):
         if config["SAVE_POLICY"]:
             _save_network(0, "policies")
 
+def test_weights(t=0.0, kappa=5.0, eps=1e-8):
+    gen     = jnp.array([1, 4, 100, 0, 0], dtype=jnp.int32)
+    cursors = jnp.array([10, 10, 10, 0, 37], dtype=jnp.int32)
+
+    weights = compute_sgs_weights(gen, cursors, t, kappa, eps)
+
+    print(f"t={t}, kappa={kappa}")
+    print("gen     :", gen.tolist())
+    print("cursors :", cursors.tolist())
+    print("weights :", [f"{w:.3e}" for w in weights.tolist()])
+    print("share   :", [f"{s:.3f}" for s in (weights / weights.sum()).tolist()])
+    exit()
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env_name", type=str, default="Craftax-Symbolic-v1")
@@ -495,8 +527,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--total_timesteps", type=lambda x: int(float(x)), default=2e9
     )  # Allow scientific notation
+    parser.add_argument("--sgs_t", type=float, default=0.5)
+    parser.add_argument("--sgs_kappa", type=float, default=5.0)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--num_steps", type=int, default=64)
+    parser.add_argument("--num_achiev", type=int, default=67)
     parser.add_argument("--update_epochs", type=int, default=4)
     parser.add_argument("--num_minibatches", type=int, default=8)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -509,6 +544,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--anneal_lr", action=argparse.BooleanOptionalAction, default=True
     )
+    parser.add_argument("--random_seed_final", type=float, default=0.3)
+    parser.add_argument("--random_seed_anneal_updates", type=int, default=400)
     parser.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--jit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int)

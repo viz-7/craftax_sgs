@@ -260,13 +260,14 @@ def make_train(config):
             ) = runner_state
 
 
-            # UPDATE SGS
-            sgs_state = update_sgs_from_trajectory(
-                sgs_state,
-                config["SGS_T"],
-                config["SGS_KAPPA"],
-                traj_batch,
-            )
+            if config["SGS"]:
+                # UPDATE SGS
+                sgs_state = update_sgs_from_trajectory(
+                    sgs_state,
+                    config["SGS_T"],
+                    config["SGS_KAPPA"],
+                    traj_batch,
+                )
 
             _, last_val = network.apply(train_state.params, last_obs)
 

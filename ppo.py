@@ -523,13 +523,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_envs",
         type=int,
-        default=512,
+        default=2800,
     )
     parser.add_argument(
-        "--total_timesteps", type=lambda x: int(float(x)), default=2e9
+        "--total_timesteps", type=lambda x: int(float(x)), default=1e9
     )  # Allow scientific notation
     parser.add_argument("--sgs", type=bool, default=True)
-    parser.add_argument("--sgs_t", type=float, default=0.5)
+    parser.add_argument("--sgs_t", type=float, default=0.1)
     parser.add_argument("--sgs_kappa", type=float, default=5.0)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--num_steps", type=int, default=64)
